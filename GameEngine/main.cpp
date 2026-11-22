@@ -44,11 +44,11 @@ enum class ShapeType { CIRCLE, POLYGON };
 
 // Regular N-sided polygon (triangle, square, pentagon, hexagon, ...),
 // vertices in local space centered at the origin.
-std::vector<Vec2> makeRegularPolygon(int sides, float circumradius) {
+std::vector<Vec2> makeRegularPolygon(int sides, float circumradius, float phase = 0.0f) {
     std::vector<Vec2> verts;
     verts.reserve(sides);
     for (int i = 0; i < sides; ++i) {
-        float angle = -PI / 2.0f + (2.0f * PI * i) / sides; // start pointing up
+        float angle = -PI / 2.0f + phase + (2.0f * PI * i) / sides; // start pointing up (+ optional phase)
         verts.push_back({ circumradius * cosf(angle), circumradius * sinf(angle) });
     }
     return verts;
@@ -78,6 +78,14 @@ struct Body {
     int assetIndex = -1;              // >= 0: draw this loaded image instead of a flat color
 
     float effectiveGravityScale() const { return gravityEnabled ? gravityScale : 0.0f; }
+
+    // Per-object properties (edited in the sandbox editor's Properties panel)
+    std::string name;
+    bool isStatic = false;            // immovable: physics never moves it, but other shapes bounce off it
+    float restitution = 0.4f;         // bounciness, 0..1
+    float friction = 0.4f;            // sliding friction, 0..1
+
+    void refreshInvMass() { invMass = (isStatic || mass <= 0.0f) ? 0.0f : 1.0f / mass; }
 
     // Circle constructor
     Body(Vec2 pos, float r, float m, Color c)
@@ -110,7 +118,7 @@ struct Body {
         radius *= f;
         for (auto& v : localVertices) v = v * f;
         mass *= f * f;
-        invMass = (mass <= 0.0f) ? 0.0f : 1.0f / mass;
+        refreshInvMass();
     }
 };
 
@@ -121,6 +129,12 @@ struct SimParams {
     float gravity = 500.0f;      // pixels/sec^2
     float restitution = 0.8f;    // 0 = no bounce, 1 = perfectly elastic
     bool paused = false;
+
+    // Used by the sandbox editor (the spawner leaves these at their defaults):
+    bool useBodyMaterials = false;   // true: each body's own bounciness + friction are used
+    float groundRestitution = 0.5f;  // bounciness of the ground and walls
+    float groundFriction = 0.6f;     // friction of the ground
+    float airDrag = 0.0f;            // slows everything down (per second)
 };
 
 // ---------------------------------------------------------
@@ -297,6 +311,7 @@ void integrate(std::vector<Body>& bodies, const SimParams& params, float dt) {
     for (auto& b : bodies) {
         if (b.invMass == 0.0f) continue; // static body, skip
         b.velocity.y += params.gravity * b.effectiveGravityScale() * dt;
+        if (params.airDrag > 0.0f) b.velocity = b.velocity * std::max(0.0f, 1.0f - params.airDrag * dt);
         b.position += b.velocity * dt;
     }
 }
@@ -314,6 +329,10 @@ void resolveWallCollisions(std::vector<Body>& bodies, const Bounds& bd, const Si
         // Below this speed a floor hit just stops the body, which prevents
         // endless micro-bouncing while something is resting on the ground.
         float restSpeed = params.gravity * b.effectiveGravityScale() * (2.0f / 60.0f);
+
+        // Bounciness / friction against the ground and walls
+        float wallE = params.useBodyMaterials ? std::min(b.restitution, params.groundRestitution) : params.restitution;
+        float groundMu = params.useBodyMaterials ? std::sqrt(b.friction * params.groundFriction) : 0.0f;
 
         // Axis-aligned extents of the body (exact for circles, bounding box for polygons)
         float minX, maxX, minY, maxY;
@@ -333,20 +352,32 @@ void resolveWallCollisions(std::vector<Body>& bodies, const Bounds& bd, const Si
         // Left / right
         if (minX < bd.left) {
             b.position.x += bd.left - minX;
-            if (b.velocity.x < 0.0f) b.velocity.x = -b.velocity.x * params.restitution;
+            if (b.velocity.x < 0.0f) b.velocity.x = -b.velocity.x * wallE;
         } else if (maxX > bd.right) {
             b.position.x -= maxX - bd.right;
-            if (b.velocity.x > 0.0f) b.velocity.x = -b.velocity.x * params.restitution;
+            if (b.velocity.x > 0.0f) b.velocity.x = -b.velocity.x * wallE;
         }
 
-        // Ceiling / floor
+        // Ceiling
         if (minY < bd.top) {
             b.position.y += bd.top - minY;
-            if (b.velocity.y < 0.0f) b.velocity.y = -b.velocity.y * params.restitution;
-        } else if (maxY > bd.bottom) {
+            if (b.velocity.y < 0.0f) b.velocity.y = -b.velocity.y * wallE;
+        }
+        // Floor (the ground)
+        else if (maxY > bd.bottom) {
             b.position.y -= maxY - bd.bottom;
             if (b.velocity.y > 0.0f) {
-                b.velocity.y = (b.velocity.y < restSpeed) ? 0.0f : -b.velocity.y * params.restitution;
+                float vn = b.velocity.y;
+                bool resting = vn < restSpeed;
+                float e = resting ? 0.0f : wallE;
+
+                // Ground friction: slows sideways sliding, limited by how hard the body presses down
+                if (groundMu > 0.0f) {
+                    float maxDv = groundMu * (1.0f + e) * vn;
+                    if (std::fabs(b.velocity.x) <= maxDv) b.velocity.x = 0.0f;
+                    else b.velocity.x -= (b.velocity.x > 0.0f ? maxDv : -maxDv);
+                }
+                b.velocity.y = resting ? 0.0f : -vn * e;
             }
         }
     }
@@ -367,7 +398,7 @@ void resolveCollisions(std::vector<Body>& bodies, const SimParams& params) {
             if (!m.colliding) continue;
 
             float totalInvMass = a.invMass + b.invMass;
-            if (totalInvMass <= 0.0f) continue; // both static
+            if (totalInvMass <= 0.0f) continue; // both immovable
 
             // --- Positional correction (stop sinking into each other) ---
             const float percent = 0.8f;
@@ -382,14 +413,28 @@ void resolveCollisions(std::vector<Body>& bodies, const SimParams& params) {
 
             // Very slow impacts don't bounce (resting contact) - otherwise stacked
             // shapes jitter forever, because gravity re-creates a tiny impact every step.
+            // With per-body materials the less bouncy of the two wins.
+            float baseE = params.useBodyMaterials ? std::min(a.restitution, b.restitution) : params.restitution;
             float restVel = std::max(30.0f, params.gravity * (2.0f / 60.0f));
-            float e = (-velAlongNormal < restVel) ? 0.0f : params.restitution;
+            float e = (-velAlongNormal < restVel) ? 0.0f : baseE;
 
             float impulseMag = -(1.0f + e) * velAlongNormal / totalInvMass;
             Vec2 impulse = m.normal * impulseMag;
 
             a.velocity -= impulse * a.invMass;
             b.velocity += impulse * b.invMass;
+
+            // --- Friction: resists sliding along the contact, limited by the normal impulse ---
+            if (params.useBodyMaterials) {
+                float mu = std::sqrt(a.friction * b.friction);
+                if (mu > 0.0f) {
+                    Vec2 tangent{ -m.normal.y, m.normal.x };
+                    float vt = (b.velocity - a.velocity).dot(tangent);
+                    float jt = std::clamp(-vt / totalInvMass, -mu * impulseMag, mu * impulseMag);
+                    a.velocity -= tangent * (jt * a.invMass);
+                    b.velocity += tangent * (jt * b.invMass);
+                }
+            }
         }
     }
 }
@@ -504,6 +549,7 @@ bool loadAsset(const std::string& rawPath) {
     return true;
 }
 
+// Loads several image files at once (from the file dialog or a drag-and-drop)
 int loadAssets(const std::vector<std::string>& paths) {
     int ok = 0;
     for (const auto& p : paths) {
@@ -513,8 +559,17 @@ int loadAssets(const std::vector<std::string>& paths) {
     return ok;
 }
 
+// ---------------------------------------------------------
+// Native "open file" dialog: browse your computer for images.
+// raylib has no file picker, so this asks the operating system for one.
+//   Windows: the standard Open dialog (comdlg32, loaded at runtime - no extra linking)
+//   macOS:   osascript's "choose file"
+//   Linux:   zenity, or kdialog as a fallback
+// Returns the chosen files (empty if cancelled). `note` explains an empty result.
+// ---------------------------------------------------------
 #ifdef _WIN32
-
+// Win32 pieces are declared by hand because <windows.h> clashes with raylib's names
+// (Rectangle, CloseWindow, DrawText, ...). Layout matches the real OPENFILENAMEW.
 namespace winapi {
 struct OpenFileNameW {
     unsigned long lStructSize;
@@ -764,15 +819,15 @@ Body makeShape(int shapeSel, Vec2 pos, float size, int sides, float rot, Color c
     case 1:
         return Body(pos, makeRegularPolygon(3, size), size, rot, size * size * 0.05f, c);
     case 2:
-        return Body(pos, makeRegularPolygon(4, size), size, rot + PI / 4.0f, size * size * 0.08f, c);
+        return Body(pos, makeRegularPolygon(4, size, PI / 4.0f), size, rot, size * size * 0.08f, c);
     case 3: {
         float w = size * 1.8f, h = size * 0.9f;
         float bounding = std::sqrt((w * 0.5f) * (w * 0.5f) + (h * 0.5f) * (h * 0.5f));
         return Body(pos, makeRectangle(w, h), bounding, rot, w * h * 0.002f, c);
     }
     default: {
-        float extra = (sides % 2 == 0) ? PI / sides : 0.0f; // even N: flat edge on the bottom
-        return Body(pos, makeRegularPolygon(sides, size), size, rot + extra, size * size * 0.05f, c);
+        float phase = (sides % 2 == 0) ? PI / sides : 0.0f; // even N: flat edge on the bottom
+        return Body(pos, makeRegularPolygon(sides, size, phase), size, rot, size * size * 0.05f, c);
     }
     }
 }
@@ -821,8 +876,8 @@ constexpr float PIXELS_PER_METER = 50.0f;
 constexpr float EARTH_G = 9.8f;          // m/s^2
 constexpr float FIXED_DT = 1.0f / 60.0f; // physics timestep
 constexpr int   TOP_H = 50;              // editor: top bar height
-constexpr int   PAL_W = 160;             // editor: palette width (left)
-constexpr int   INS_W = 270;             // editor: inspector width (right)
+constexpr int   LEFT_W = 250;            // editor: Add + Scene list (left)
+constexpr int   INS_W = 300;             // editor: Properties panel (right)
 constexpr int   ASSET_H = 150;           // editor: Assests shelf height (bottom)
 constexpr int   PALETTE_COUNT = 5;
 
@@ -840,17 +895,25 @@ struct SpawnerState {
     bool randomColor = true;
 };
 
+struct HexField {
+    char buf[16] = "#FFFFFF";
+    bool edit = false;
+    int owner = -99;          // what the box currently shows; editing restarts when this changes
+};
+
 struct Editor {
     std::vector<Body> bodies;
-    SimParams params;             // gravity is fixed at 1g; each shape opts in and scales it
+    SimParams params;         // gravity is driven by the Environment settings below
     bool paused = false;
 
-    int selected = -1;            // index of the selected body, -1 = none
-    int dragging = -1;            // index of the body being dragged, -1 = none
+    // Selection: index of the selected object, or -1 = the Environment is selected
+    int selected = -1;
+    int lastSelected = -99;
+    int dragging = -1;        // index of the body being dragged, -1 = none
     Vec2 dragOffset{ 0, 0 };
     Vec2 dragVelocity{ 0, 0 };    // smoothed mouse velocity, applied when you let go (throw)
 
-    int paletteDrag = -1;         // palette item being dragged into the world, -1 = none
+    int paletteDrag = -1;         // "Add" item being dragged into the world, -1 = none
     Color paletteColor = SKYBLUE;
     float paletteSides = 5.0f;
 
@@ -860,16 +923,33 @@ struct Editor {
     bool pathEdit = false;
     bool browseRequested = false; // set by the Browse button, handled after the frame is drawn
 
+    int nextObjectId = 1;         // used for default names like "Circle 3"
+
+    // ---- Environment properties ----
+    float gravityMs2 = EARTH_G;   // world gravity in m/s^2 (objects opt in to it)
+    float timeScale = 1.0f;       // slow motion / fast forward
     float groundOffset = 110.0f;  // how far the ground surface sits above the bottom of the world
+    Color groundColor = Theme::GROUND;
+    Color backgroundColor = Theme::WORLD;
+    bool showGrid = true;
+    int envColorTarget = 0;       // which color the Environment color editor shows: 0 ground, 1 background
     bool draggingGround = false;
 
-    char hexBuf[16] = "#FFFFFF";
-    bool hexEdit = false;
-    int hexOwner = -2;            // which selection hexBuf currently belongs to
+    // ---- Panel state ----
+    float listScroll = 0.0f;
+    float inspectorScroll = 0.0f;
+    float inspectorContentH = 0.0f;
+    bool objSection[3] = { true, true, true };
+    bool envSection[4] = { true, true, true, true };
+    HexField hex;
+    char nameBuf[64] = "";
+    bool nameEdit = false;
+    int nameOwner = -99;
 };
 
+// "Add" grid on the left: 3 cells per row
 Rectangle paletteCell(int i) {
-    return { 20.0f, (float)(TOP_H + 55 + i * 85), 120.0f, 75.0f };
+    return { 12.0f + (i % 3) * 78.0f, (float)(TOP_H + 36) + (i / 3) * 78.0f, 70.0f, 70.0f };
 }
 
 Rectangle assetCell(int i, const Rectangle& shelf, float scroll) {
@@ -971,44 +1051,324 @@ void spawnerFrame(SpawnerState& s, float& accumulator, AppMode& mode) {
 }
 
 // =========================================================
-// Sandbox editor mode (drag & drop, per-shape settings, images, movable ground)
+// Sandbox editor
+//   Left:   "Add" (drag shapes in) + "Scene" (list of everything in the world)
+//   Middle: the work area, with the Assests shelf underneath
+//   Right:  Properties of whatever is selected (an object, or the Environment)
+// =========================================================
+
+constexpr float LIST_ROW_H = 26.0f;
+constexpr float UI_LABEL_W = 96.0f;
+constexpr float UI_ROW_H = 26.0f;
+static const char* PALETTE_NAMES[PALETTE_COUNT] = { "Circle", "Triangle", "Square", "Rectangle", "Polygon" };
+
+float luminance(Color c) { return 0.299f * c.r + 0.587f * c.g + 0.114f * c.b; }
+
+// Text color that is readable on top of `bg`
+Color textOn(Color bg, float alpha) { return luminance(bg) < 140.0f ? Fade(WHITE, alpha) : Fade(BLACK, alpha); }
+
+// A slightly lighter (dark colors) or darker (light colors) version of c, for edges and grid lines
+Color edgeOf(Color c) {
+    float t = 0.25f;
+    if (luminance(c) < 128.0f) return Color{ (unsigned char)(c.r + (255 - c.r) * t), (unsigned char)(c.g + (255 - c.g) * t),
+                                              (unsigned char)(c.b + (255 - c.b) * t), 255 };
+    return Color{ (unsigned char)(c.r * (1 - t)), (unsigned char)(c.g * (1 - t)), (unsigned char)(c.b * (1 - t)), 255 };
+}
+
+// ---- Adding / copying objects ----
+void addObject(Editor& ed, Body b, const std::string& base) {
+    b.gravityEnabled = false;                          // gravity stays off until enabled
+    b.name = base + " " + std::to_string(ed.nextObjectId++);
+    ed.bodies.push_back(b);
+    ed.selected = (int)ed.bodies.size() - 1;
+}
+
+void duplicateObject(Editor& ed, int index) {
+    Body c = ed.bodies[index];
+    c.position += Vec2{ 30.0f, 30.0f };
+    c.velocity = Vec2{ 0, 0 };
+    c.name += " copy";
+    ed.bodies.push_back(c);
+    ed.selected = (int)ed.bodies.size() - 1;
+}
+
+// ---- Tiny immediate-mode UI helpers for the Properties panel ----
+// The panel scrolls, so interactive widgets are only drawn when fully inside the visible area.
+struct Ui {
+    float x, w;          // content column
+    float top, bottom;   // visible range
+    float y;             // current row
+    Vector2 mouse;
+    bool vis(float h) const { return y >= top && y + h <= bottom; }
+};
+
+// Collapsible section header. Returns whether the section is open.
+bool uiSection(Ui& ui, const char* title, bool& open) {
+    Rectangle r = { ui.x - 8, ui.y, ui.w + 16, 24 };
+    bool hovered = CheckCollisionPointRec(ui.mouse, r) && ui.mouse.y >= ui.top && ui.mouse.y <= ui.bottom;
+    DrawRectangleRec(r, hovered ? Color{ 58, 64, 84, 255 } : Theme::CELL);
+    DrawText(open ? "-" : "+", (int)r.x + 9, (int)r.y + 4, 16, Theme::TEXT_DIM);
+    DrawText(title, (int)r.x + 28, (int)r.y + 5, 14, Theme::TEXT);
+    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) open = !open;
+    ui.y += 30;
+    return open;
+}
+
+void uiLabel(Ui& ui, const char* text, Color col = Theme::TEXT_DIM, int size = 12) {
+    DrawText(text, (int)ui.x, (int)ui.y, size, col);
+    ui.y += size + 6;
+}
+
+// Labelled slider. Returns true when the user changed the value.
+bool uiSlider(Ui& ui, const char* label, float& value, float lo, float hi, const char* fmt, bool enabled = true) {
+    bool changed = false;
+    Color tc = enabled ? Theme::TEXT : Theme::TEXT_DIM;
+    DrawText(label, (int)ui.x, (int)ui.y + 3, 14, tc);
+    float barX = ui.x + UI_LABEL_W;
+    float barW = ui.w - UI_LABEL_W - 64.0f;
+    if (ui.vis(20)) {
+        float v = value;
+        if (!enabled) GuiDisable();
+        GuiSlider({ barX, ui.y, barW, 20 }, nullptr, nullptr, &v, lo, hi);
+        if (!enabled) GuiEnable();
+        if (enabled && std::fabs(v - value) > 1e-4f) { value = v; changed = true; }
+    }
+    DrawText(TextFormat(fmt, value), (int)(barX + barW + 8), (int)ui.y + 3, 14, tc);
+    ui.y += UI_ROW_H;
+    return changed;
+}
+
+bool uiCheck(Ui& ui, const char* label, bool& value, bool enabled = true) {
+    bool changed = false;
+    if (ui.vis(20)) {
+        bool v = value;
+        if (!enabled) GuiDisable();
+        GuiCheckBox({ ui.x, ui.y, 20, 20 }, nullptr, &v);
+        if (!enabled) GuiEnable();
+        if (enabled && v != value) { value = v; changed = true; }
+    }
+    DrawText(label, (int)ui.x + 28, (int)ui.y + 3, 14, enabled ? Theme::TEXT : Theme::TEXT_DIM);
+    ui.y += UI_ROW_H;
+    return changed;
+}
+
+// One button (full width) or two side by side. Returns 0 (none), 1 (first) or 2 (second).
+int uiButtons(Ui& ui, const char* a, const char* b = nullptr) {
+    int result = 0;
+    if (ui.vis(28)) {
+        if (b) {
+            float bw = (ui.w - 8.0f) / 2.0f;
+            if (GuiButton({ ui.x, ui.y, bw, 28 }, a)) result = 1;
+            if (GuiButton({ ui.x + bw + 8.0f, ui.y, bw, 28 }, b)) result = 2;
+        } else if (GuiButton({ ui.x, ui.y, ui.w, 28 }, a)) {
+            result = 1;
+        }
+    }
+    ui.y += 34;
+    return result;
+}
+
+void uiTextRow(Ui& ui, const char* label, char* buf, int bufSize, bool& edit) {
+    DrawText(label, (int)ui.x, (int)ui.y + 6, 14, Theme::TEXT);
+    if (ui.vis(26)) {
+        if (GuiTextBox({ ui.x + UI_LABEL_W, ui.y, ui.w - UI_LABEL_W, 26 }, buf, bufSize, edit)) edit = !edit;
+    } else {
+        edit = false; // scrolled out of view: stop typing into it
+    }
+    ui.y += 32;
+}
+
+// Hex box + swatch + color picker for one color. Returns true when the color changed.
+bool uiColor(Ui& ui, const char* label, Color& color, HexField& hf, int ownerKey) {
+    bool changed = false;
+    if (hf.owner != ownerKey) { hf.owner = ownerKey; hf.edit = false; }
+    if (!hf.edit) std::snprintf(hf.buf, sizeof(hf.buf), "#%02X%02X%02X", color.r, color.g, color.b);
+
+    DrawText(label, (int)ui.x, (int)ui.y + 6, 14, Theme::TEXT);
+    if (ui.vis(26)) {
+        if (GuiTextBox({ ui.x + UI_LABEL_W, ui.y, 96, 26 }, hf.buf, 8, hf.edit)) hf.edit = !hf.edit;
+        if (hf.edit) {
+            Color parsed;
+            if (parseHexColor(hf.buf, parsed) && (parsed.r != color.r || parsed.g != color.g || parsed.b != color.b)) {
+                color = parsed;
+                changed = true;
+            }
+        }
+    } else {
+        hf.edit = false;
+    }
+    DrawRectangle((int)(ui.x + UI_LABEL_W + 104), (int)ui.y, 26, 26, color);
+    DrawRectangleLines((int)(ui.x + UI_LABEL_W + 104), (int)ui.y, 26, 26, Theme::BORDER);
+    ui.y += 32;
+
+    // Picker: only adopt its value while the user is actually dragging inside it
+    Rectangle area = { ui.x - 4, ui.y - 2, ui.w + 8, 156 };
+    if (ui.vis(150)) {
+        Color picked = color;
+        GuiColorPicker({ ui.x + 4, ui.y, 150, 150 }, "", &picked);
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(ui.mouse, area) &&
+            (picked.r != color.r || picked.g != color.g || picked.b != color.b)) {
+            color = Color{ picked.r, picked.g, picked.b, 255 };
+            changed = true;
+        }
+    }
+    ui.y += 158;
+    return changed;
+}
+
+// ---- Properties: the selected object ----
+void objectInspector(Editor& ed, Ui& ui, const Bounds& bd, bool& deleteSelected, bool& duplicateSelected) {
+    Body& s = ed.bodies[ed.selected];
+    bool isCircle = s.shape == ShapeType::CIRCLE;
+    bool isImage = s.assetIndex >= 0;
+
+    // Name
+    if (ed.nameOwner != ed.selected) { ed.nameOwner = ed.selected; ed.nameEdit = false; }
+    if (!ed.nameEdit) std::snprintf(ed.nameBuf, sizeof(ed.nameBuf), "%s", s.name.c_str());
+    uiTextRow(ui, "Name", ed.nameBuf, 40, ed.nameEdit);
+    if (ed.nameEdit) s.name = ed.nameBuf;
+    uiLabel(ui, shapeName(s));
+    int act = uiButtons(ui, "Duplicate (Ctrl+D)", "Delete (Del)");
+    if (act == 1) duplicateSelected = true;
+    if (act == 2) deleteSelected = true;
+
+    if (uiSection(ui, "Transform", ed.objSection[0])) {
+        float px = s.position.x;
+        if (uiSlider(ui, "Position X", px, bd.left, bd.right, "%.0f")) s.position.x = px;
+        float py = s.position.y;
+        if (uiSlider(ui, "Position Y", py, bd.top, bd.bottom, "%.0f")) s.position.y = py;
+        float deg = s.rotation * RAD2DEG;
+        if (uiSlider(ui, "Rotation", deg, -180.0f, 180.0f, "%.0f deg", !isCircle)) s.rotation = deg * DEG2RAD;
+        float size = s.radius;
+        if (uiSlider(ui, "Size", size, 8.0f, 300.0f, "%.0f")) s.scaleBy(size / s.radius);
+        ui.y += 4;
+    }
+
+    if (uiSection(ui, "Physics", ed.objSection[1])) {
+        bool st = s.isStatic;
+        if (uiCheck(ui, "Static (immovable)", st)) {
+            s.isStatic = st;
+            s.refreshInvMass();
+            if (st) s.velocity = Vec2{ 0, 0 };
+        }
+        bool dyn = !s.isStatic;
+        float mass = s.mass;
+        if (uiSlider(ui, "Mass", mass, 0.1f, 200.0f, "%.1f", dyn)) { s.mass = mass; s.refreshInvMass(); }
+        uiSlider(ui, "Bounciness", s.restitution, 0.0f, 1.0f, "%.2f");
+        uiSlider(ui, "Friction", s.friction, 0.0f, 1.0f, "%.2f");
+
+        bool ge = s.gravityEnabled;
+        if (uiCheck(ui, "Enable gravity", ge, dyn)) {
+            if (ge && s.gravityScale <= 0.0f) s.gravityScale = 1.0f;
+            s.gravityEnabled = ge;
+        }
+        uiSlider(ui, "Gravity scale", s.gravityScale, 0.0f, 3.0f, "%.2fx", dyn && s.gravityEnabled);
+        float effective = (dyn && s.gravityEnabled) ? s.gravityScale * ed.gravityMs2 : 0.0f;
+        uiLabel(ui, TextFormat("= %.1f m/s^2 on this object", effective));
+        ui.y += 4;
+    }
+
+    if (uiSection(ui, "Appearance", ed.objSection[2])) {
+        uiColor(ui, isImage ? "Tint" : "Color", s.color, ed.hex, ed.selected);
+    }
+
+}
+
+// ---- Properties: the Environment (nothing selected) ----
+void environmentInspector(Editor& ed, Ui& ui, float maxGroundOffset) {
+    uiLabel(ui, "Settings for the whole scene.");
+    ui.y += 2;
+
+    if (uiSection(ui, "Gravity & motion", ed.envSection[0])) {
+        uiSlider(ui, "Gravity", ed.gravityMs2, 0.0f, 30.0f, "%.1f");
+        uiLabel(ui, "m/s^2 (Earth = 9.8). Objects opt in.");
+        uiSlider(ui, "Air drag", ed.params.airDrag, 0.0f, 2.0f, "%.2f");
+        uiSlider(ui, "Time scale", ed.timeScale, 0.1f, 2.0f, "%.2fx");
+        int act = uiButtons(ui, "All gravity on", "All gravity off");
+        if (act == 1) for (auto& b : ed.bodies) b.gravityEnabled = true;
+        if (act == 2) for (auto& b : ed.bodies) b.gravityEnabled = false;
+        ui.y += 2;
+    }
+
+    if (uiSection(ui, "Ground", ed.envSection[1])) {
+        uiSlider(ui, "Height", ed.groundOffset, 10.0f, maxGroundOffset, "%.0f");
+        uiSlider(ui, "Bounciness", ed.params.groundRestitution, 0.0f, 1.0f, "%.2f");
+        uiSlider(ui, "Friction", ed.params.groundFriction, 0.0f, 1.0f, "%.2f");
+        uiLabel(ui, "Tip: drag the ground line in the world.");
+        ui.y += 2;
+    }
+
+    if (uiSection(ui, "Colors", ed.envSection[2])) {
+        if (ui.vis(26)) GuiToggleGroup({ ui.x, ui.y, (ui.w - 4.0f) / 2.0f, 26 }, "Ground;Background", &ed.envColorTarget);
+        ui.y += 32;
+        Color& c = (ed.envColorTarget == 0) ? ed.groundColor : ed.backgroundColor;
+        uiColor(ui, ed.envColorTarget == 0 ? "Ground" : "Background", c, ed.hex, 1000 + ed.envColorTarget);
+    }
+
+    if (uiSection(ui, "View", ed.envSection[3])) {
+        uiCheck(ui, "Show grid", ed.showGrid);
+        uiLabel(ui, "1 square = 1 m, measured up from ground.");
+        ui.y += 2;
+    }
+
+    uiLabel(ui, TextFormat("%d object%s in the scene", (int)ed.bodies.size(), ed.bodies.size() == 1 ? "" : "s"));
+}
+
+// =========================================================
+// The editor frame
 // =========================================================
 void editorFrame(Editor& ed, float& accumulator, AppMode& mode) {
     const int W = GetScreenWidth();
     const int H = GetScreenHeight();
     const int insX = W - INS_W;
-    const int worldW = W - PAL_W - INS_W;
+    const int worldW = W - LEFT_W - INS_W;
     const int worldBottom = H - ASSET_H;   // the world ends where the Assests shelf begins
 
     // Keep the ground inside the world (also after the window is resized)
     float maxOffset = std::max(60.0f, (float)(worldBottom - TOP_H - 100));
     ed.groundOffset = std::clamp(ed.groundOffset, 10.0f, maxOffset);
     float groundY = (float)worldBottom - ed.groundOffset;
+    ed.params.gravity = ed.gravityMs2 * PIXELS_PER_METER;
 
     Vector2 mouse = GetMousePosition();
     Vec2 m{ mouse.x, mouse.y };
-    Rectangle worldRect = { (float)PAL_W, (float)TOP_H, (float)worldW, (float)(worldBottom - TOP_H) };
-    Rectangle shelfRect = { (float)PAL_W, (float)worldBottom, (float)worldW, (float)ASSET_H };
+    Rectangle worldRect = { (float)LEFT_W, (float)TOP_H, (float)worldW, (float)(worldBottom - TOP_H) };
+    Rectangle shelfRect = { (float)LEFT_W, (float)worldBottom, (float)worldW, (float)ASSET_H };
+    Rectangle insRect = { (float)insX, (float)TOP_H, (float)INS_W, (float)(H - TOP_H) };
+    const float listTop = (float)(TOP_H + 250);
+    Rectangle listRect = { 6.0f, listTop, (float)(LEFT_W - 12), std::max(40.0f, (float)H - listTop - 8.0f) };
+    const float insViewTop = (float)(TOP_H + 40);
+    const float insViewBottom = (float)H - 8.0f;
     bool mouseInWorld = CheckCollisionPointRec(mouse, worldRect);
     bool mouseInShelf = CheckCollisionPointRec(mouse, shelfRect);
-    Bounds bounds{ (float)PAL_W, (float)TOP_H, (float)insX, groundY };
+    bool mouseInList = CheckCollisionPointRec(mouse, listRect);
+    bool mouseInInspector = CheckCollisionPointRec(mouse, insRect);
+    Bounds bounds{ (float)LEFT_W, (float)TOP_H, (float)insX, groundY };
 
-    if (ed.selected >= (int)ed.bodies.size()) ed.selected = -1;
-    if (ed.dragging >= (int)ed.bodies.size()) ed.dragging = -1;
+    int objCount = (int)ed.bodies.size();
+    if (ed.selected >= objCount) ed.selected = -1;
+    if (ed.dragging >= objCount) ed.dragging = -1;
     if (ed.assetDrag >= (int)g_assets.size()) ed.assetDrag = -1;
+    g_textEditing = ed.hex.edit || ed.nameEdit || ed.pathEdit;
 
-    g_textEditing = ed.hexEdit || ed.pathEdit;
+    // ---- Scrolling (mouse wheel over a panel) ----
+    float wheel = GetMouseWheelMove();
+    float listContentH = (float)(objCount + 1) * LIST_ROW_H;
+    if (mouseInList) ed.listScroll -= wheel * 40.0f;
+    ed.listScroll = std::clamp(ed.listScroll, 0.0f, std::max(0.0f, listContentH - listRect.height));
 
-    // ---- Assests shelf scrolling ----
-    float contentW = (float)g_assets.size() * 110.0f + 10.0f;
-    float maxScroll = std::max(0.0f, contentW - (float)worldW);
-    if (mouseInShelf) ed.assetScroll -= GetMouseWheelMove() * 60.0f;
-    ed.assetScroll = std::clamp(ed.assetScroll, 0.0f, maxScroll);
+    float insViewH = insViewBottom - insViewTop;
+    if (mouseInInspector) ed.inspectorScroll -= wheel * 40.0f;
+    ed.inspectorScroll = std::clamp(ed.inspectorScroll, 0.0f, std::max(0.0f, ed.inspectorContentH - insViewH));
+
+    float shelfContentW = (float)g_assets.size() * 110.0f + 10.0f;
+    if (mouseInShelf) ed.assetScroll -= wheel * 60.0f;
+    ed.assetScroll = std::clamp(ed.assetScroll, 0.0f, std::max(0.0f, shelfContentW - (float)worldW));
 
     // ---- What is the mouse over? ----
     int hoverBody = -1;
     if (mouseInWorld && ed.paletteDrag < 0 && ed.assetDrag < 0) {
-        for (int i = (int)ed.bodies.size() - 1; i >= 0; --i) { // topmost first
+        for (int i = objCount - 1; i >= 0; --i) { // topmost first
             if (containsPoint(ed.bodies[i], m)) { hoverBody = i; break; }
         }
     }
@@ -1020,19 +1380,29 @@ void editorFrame(Editor& ed, float& accumulator, AppMode& mode) {
     else if (hoverBody >= 0) cursor = MOUSE_CURSOR_POINTING_HAND;
     SetMouseCursor(cursor);
 
-    // ---- Mouse press: start a palette/asset drag, pick a body, or grab the ground ----
+    // ---- Mouse press ----
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        // Start dragging a shape out of the "Add" grid
         for (int i = 0; i < PALETTE_COUNT; ++i) {
             if (CheckCollisionPointRec(mouse, paletteCell(i))) {
                 ed.paletteDrag = i;
                 ed.paletteColor = randomBrightColor();
             }
         }
+        // Start dragging an image out of the Assests shelf
         if (mouseInShelf && mouse.y > shelfRect.y + 34.0f) {
             for (int i = 0; i < (int)g_assets.size(); ++i) {
                 if (CheckCollisionPointRec(mouse, assetCell(i, shelfRect, ed.assetScroll))) ed.assetDrag = i;
             }
         }
+        // Pick something from the Scene list (row 0 is the Environment)
+        if (mouseInList) {
+            for (int r = 0; r <= objCount; ++r) {
+                Rectangle row = { listRect.x, listRect.y + r * LIST_ROW_H - ed.listScroll, listRect.width, LIST_ROW_H - 2.0f };
+                if (CheckCollisionPointRec(mouse, row)) ed.selected = r - 1;
+            }
+        }
+        // Work area: pick a shape, grab the ground line, or click empty space (= Environment)
         if (mouseInWorld) {
             if (hoverBody >= 0) {
                 ed.selected = hoverBody;
@@ -1047,23 +1417,20 @@ void editorFrame(Editor& ed, float& accumulator, AppMode& mode) {
         }
     }
 
-    // ---- Palette / asset drop: create the item where the mouse was released ----
-    // New shapes start with gravity OFF; turn it on per shape in the inspector.
+    // ---- Drop: create the item where the mouse was released (gravity starts OFF) ----
     if (ed.paletteDrag >= 0 && !IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
         if (mouseInWorld) {
-            Body nb = makeShape(ed.paletteDrag, m, 28.0f, (int)ed.paletteSides, 0.0f, ed.paletteColor);
-            nb.gravityEnabled = false;
-            ed.bodies.push_back(nb);
-            ed.selected = (int)ed.bodies.size() - 1;
+            addObject(ed, makeShape(ed.paletteDrag, m, 28.0f, (int)ed.paletteSides, 0.0f, ed.paletteColor),
+                      PALETTE_NAMES[ed.paletteDrag]);
         }
         ed.paletteDrag = -1;
     }
     if (ed.assetDrag >= 0 && !IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
         if (mouseInWorld) {
-            Body nb = makeImageBody(ed.assetDrag, m);
-            nb.gravityEnabled = false;
-            ed.bodies.push_back(nb);
-            ed.selected = (int)ed.bodies.size() - 1;
+            std::string stem = g_assets[ed.assetDrag].name;
+            size_t dot = stem.rfind('.');
+            if (dot != std::string::npos && dot > 0) stem = stem.substr(0, dot);
+            addObject(ed, makeImageBody(ed.assetDrag, m), stem);
         }
         ed.assetDrag = -1;
     }
@@ -1080,7 +1447,7 @@ void editorFrame(Editor& ed, float& accumulator, AppMode& mode) {
         } else {
             float speed = ed.dragVelocity.length();
             if (speed > 1500.0f) ed.dragVelocity = ed.dragVelocity * (1500.0f / speed);
-            d.velocity = ed.dragVelocity;
+            d.velocity = d.isStatic ? Vec2{ 0, 0 } : ed.dragVelocity;
             ed.dragging = -1;
         }
     }
@@ -1096,9 +1463,23 @@ void editorFrame(Editor& ed, float& accumulator, AppMode& mode) {
         }
     }
 
-    // ---- Delete key (not while typing in a text box) ----
-    bool deleteSelected = false;
-    if (IsKeyPressed(KEY_DELETE) && !g_textEditing && ed.selected >= 0) deleteSelected = true;
+    // ---- Keyboard shortcuts (not while typing in a text box) ----
+    bool deleteSelected = false, duplicateSelected = false;
+    if (!g_textEditing && ed.selected >= 0) {
+        if (IsKeyPressed(KEY_DELETE)) deleteSelected = true;
+        if (IsKeyPressed(KEY_D) && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL))) duplicateSelected = true;
+    }
+
+    // ---- When the selection changes: reset the properties scroll, keep the list row in view ----
+    if (ed.selected != ed.lastSelected) {
+        ed.lastSelected = ed.selected;
+        ed.inspectorScroll = 0.0f;
+        float contentH = (float)((int)ed.bodies.size() + 1) * LIST_ROW_H;
+        float rowTop = (float)(ed.selected + 1) * LIST_ROW_H;
+        if (rowTop < ed.listScroll) ed.listScroll = rowTop;
+        else if (rowTop + LIST_ROW_H > ed.listScroll + listRect.height) ed.listScroll = rowTop + LIST_ROW_H - listRect.height;
+        ed.listScroll = std::clamp(ed.listScroll, 0.0f, std::max(0.0f, contentH - listRect.height));
+    }
 
     // ---- Physics ----
     // A body being dragged is made temporarily immovable so it pushes others out of the way.
@@ -1111,7 +1492,7 @@ void editorFrame(Editor& ed, float& accumulator, AppMode& mode) {
     if (!ed.paused) {
         accumulator = std::min(accumulator + GetFrameTime(), 0.25f);
         while (accumulator >= FIXED_DT) {
-            stepWorld(ed.bodies, bounds, ed.params, FIXED_DT);
+            stepWorld(ed.bodies, bounds, ed.params, FIXED_DT * ed.timeScale);
             accumulator -= FIXED_DT;
         }
     } else {
@@ -1120,36 +1501,39 @@ void editorFrame(Editor& ed, float& accumulator, AppMode& mode) {
     }
     if (pinned) ed.bodies[ed.dragging].invMass = savedInvMass;
 
-    // The hex box must restart whenever the selection changes
-    if (ed.selected != ed.hexOwner) {
-        ed.hexOwner = ed.selected;
-        ed.hexEdit = false;
-    }
-
     // =====================================================
     // Render
     // =====================================================
     BeginDrawing();
     ClearBackground(Theme::BG);
 
-    // World + ground
-    DrawRectangleRec(worldRect, Theme::WORLD);
-    DrawRectangle(PAL_W, (int)groundY, worldW, worldBottom - (int)groundY, Theme::GROUND);
-    DrawRectangle(PAL_W, (int)groundY, worldW, 4, Theme::GROUND_TOP);
+    // ---- Work area: background, grid, ground ----
+    DrawRectangleRec(worldRect, ed.backgroundColor);
+    if (ed.showGrid) {
+        Color gc = luminance(ed.backgroundColor) < 128.0f ? Fade(WHITE, 0.06f) : Fade(BLACK, 0.08f);
+        BeginScissorMode((int)worldRect.x, (int)worldRect.y, (int)worldRect.width, (int)worldRect.height);
+        for (float gx = (float)LEFT_W; gx <= (float)(LEFT_W + worldW); gx += PIXELS_PER_METER)
+            DrawLine((int)gx, TOP_H, (int)gx, worldBottom, gc);
+        for (float gy = groundY; gy >= (float)TOP_H; gy -= PIXELS_PER_METER)
+            DrawLine(LEFT_W, (int)gy, LEFT_W + worldW, (int)gy, gc);
+        EndScissorMode();
+    }
+    DrawRectangle(LEFT_W, (int)groundY, worldW, worldBottom - (int)groundY, ed.groundColor);
+    DrawRectangle(LEFT_W, (int)groundY, worldW, 4, edgeOf(ed.groundColor));
     {
-        float gx = PAL_W + worldW / 2.0f;
+        float gx = LEFT_W + worldW / 2.0f;
         bool hot = nearGround || ed.draggingGround;
-        DrawRectangleRounded({ gx - 26, groundY - 5, 52, 10 }, 0.8f, 8, hot ? ORANGE : Theme::GROUND_TOP);
+        DrawRectangleRounded({ gx - 26, groundY - 5, 52, 10 }, 0.8f, 8, hot ? ORANGE : edgeOf(ed.groundColor));
         if (groundY + 30 < worldBottom) {
-            DrawText("Ground - drag the line to move it", PAL_W + 12, (int)groundY + 14, 14, Fade(WHITE, 0.55f));
+            DrawText("Ground - drag the line to move it", LEFT_W + 12, (int)groundY + 14, 14, textOn(ed.groundColor, 0.55f));
         }
     }
 
     for (int i = 0; i < (int)ed.bodies.size(); ++i) drawBody(ed.bodies[i], i == ed.selected);
 
-    // ---- Assests shelf (bottom) ----
+    // ---- Assests shelf (bottom of the work area) ----
     DrawRectangleRec(shelfRect, Theme::PANEL);
-    DrawLine(PAL_W, worldBottom, PAL_W + worldW, worldBottom, Theme::BORDER);
+    DrawLine(LEFT_W, worldBottom, LEFT_W + worldW, worldBottom, Theme::BORDER);
     BeginScissorMode((int)shelfRect.x, (int)shelfRect.y, (int)shelfRect.width, (int)shelfRect.height);
     {
         float sx = shelfRect.x, sy = shelfRect.y;
@@ -1214,102 +1598,97 @@ void editorFrame(Editor& ed, float& accumulator, AppMode& mode) {
         ed.selected = -1;
         ed.dragging = -1;
     }
-    DrawText(TextFormat("Bodies: %d", (int)ed.bodies.size()), 690, 16, 18, Theme::TEXT);
+    DrawText(TextFormat("Objects: %d", (int)ed.bodies.size()), 690, 16, 18, Theme::TEXT);
     DrawText("F11: fullscreen", W - 130, 18, 14, Theme::TEXT_DIM);
 
-    // ---- Palette (left) ----
-    DrawRectangle(0, TOP_H, PAL_W, H - TOP_H, Theme::PANEL);
-    DrawLine(PAL_W, TOP_H, PAL_W, H, Theme::BORDER);
-    DrawText("Palette", 20, TOP_H + 10, 18, Theme::TEXT);
-    DrawText("drag into the world", 20, TOP_H + 32, 12, Theme::TEXT_DIM);
-    static const char* paletteNames[PALETTE_COUNT] = { "Circle", "Triangle", "Square", "Rectangle", "Polygon" };
+    // ---- Left panel: Add + Scene list ----
+    DrawRectangle(0, TOP_H, LEFT_W, H - TOP_H, Theme::PANEL);
+    DrawLine(LEFT_W, TOP_H, LEFT_W, H, Theme::BORDER);
+
+    DrawText("Add", 14, TOP_H + 10, 18, Theme::TEXT);
+    DrawText("drag into the work area", 58, TOP_H + 14, 12, Theme::TEXT_DIM);
     for (int i = 0; i < PALETTE_COUNT; ++i) {
         Rectangle cell = paletteCell(i);
         bool hovered = CheckCollisionPointRec(mouse, cell);
         DrawRectangleRec(cell, hovered ? Color{ 58, 64, 84, 255 } : Theme::CELL);
         DrawRectangleLinesEx(cell, 1.0f, Theme::BORDER);
-        Body icon = makeShape(i, Vec2{ cell.x + cell.width / 2.0f, cell.y + 30.0f }, 20.0f,
+        Body icon = makeShape(i, Vec2{ cell.x + cell.width / 2.0f, cell.y + 28.0f }, 16.0f,
                               (int)ed.paletteSides, 0.0f, SKYBLUE);
         drawBody(icon);
-        DrawText(paletteNames[i], (int)cell.x + 8, (int)cell.y + 58, 14, Theme::TEXT);
+        int tw = MeasureText(PALETTE_NAMES[i], 12);
+        DrawText(PALETTE_NAMES[i], (int)(cell.x + (cell.width - tw) / 2.0f), (int)cell.y + 53, 12, Theme::TEXT);
     }
-    GuiSlider({ 55, (float)(TOP_H + 55 + PALETTE_COUNT * 85 + 10), 70, 20 }, "Sides",
-              TextFormat("%d", (int)ed.paletteSides), &ed.paletteSides, 3.0f, 12.0f);
+    // 6th grid slot: polygon side count
+    DrawText("Polygon", 172, TOP_H + 124, 12, Theme::TEXT_DIM);
+    DrawText(TextFormat("sides: %d", (int)ed.paletteSides), 172, TOP_H + 140, 12, Theme::TEXT);
+    GuiSlider({ 170, (float)(TOP_H + 160), 66, 18 }, nullptr, nullptr, &ed.paletteSides, 3.0f, 12.0f);
 
-    // ---- Inspector (right) ----
+    DrawText("Scene", 14, TOP_H + 222, 18, Theme::TEXT);
+    DrawText(TextFormat("%d object%s", (int)ed.bodies.size(), ed.bodies.size() == 1 ? "" : "s"), 78, TOP_H + 227, 12, Theme::TEXT_DIM);
+
+    BeginScissorMode((int)listRect.x, (int)listRect.y, (int)listRect.width, (int)listRect.height);
+    for (int r = 0; r <= (int)ed.bodies.size(); ++r) {
+        float ry = listRect.y + r * LIST_ROW_H - ed.listScroll;
+        if (ry + LIST_ROW_H < listRect.y || ry > listRect.y + listRect.height) continue;
+        Rectangle row = { listRect.x, ry, listRect.width, LIST_ROW_H - 2.0f };
+        bool sel = (r - 1 == ed.selected);
+        bool hov = mouseInList && CheckCollisionPointRec(mouse, row);
+        DrawRectangleRec(row, sel ? Color{ 54, 104, 184, 255 } : (hov ? Color{ 58, 64, 84, 255 } : Theme::CELL));
+
+        if (r == 0) {
+            DrawCircleLines((int)row.x + 16, (int)(row.y + row.height / 2), 7.0f, Theme::TEXT);
+            DrawLine((int)row.x + 9, (int)(row.y + row.height / 2), (int)row.x + 23, (int)(row.y + row.height / 2), Theme::TEXT);
+            DrawText("Environment", (int)row.x + 32, (int)row.y + 6, 14, Theme::TEXT);
+        } else {
+            const Body& b = ed.bodies[r - 1];
+            float cx = row.x + 16.0f, cy = row.y + row.height / 2.0f;
+            if (b.assetIndex >= 0 && b.assetIndex < (int)g_assets.size()) {
+                const Texture2D& tex = g_assets[b.assetIndex].tex;
+                float fit = std::min(16.0f / (float)tex.width, 16.0f / (float)tex.height);
+                float tw = tex.width * fit, th = tex.height * fit;
+                DrawTexturePro(tex, Rectangle{ 0, 0, (float)tex.width, (float)tex.height },
+                               Rectangle{ cx - tw / 2.0f, cy - th / 2.0f, tw, th }, Vector2{ 0, 0 }, 0.0f, WHITE);
+            } else if (b.shape == ShapeType::CIRCLE) {
+                DrawCircle((int)cx, (int)cy, 7.0f, b.color);
+            } else {
+                DrawRectangle((int)cx - 7, (int)cy - 7, 14, 14, b.color);
+            }
+            std::string label = b.name.empty() ? "(unnamed)" : b.name;
+            if (label.size() > 20) label = label.substr(0, 18) + "..";
+            DrawText(label.c_str(), (int)row.x + 32, (int)row.y + 6, 14, Theme::TEXT);
+            if (b.isStatic) {
+                int sw = MeasureText("static", 11);
+                DrawText("static", (int)(row.x + row.width - sw - 6), (int)row.y + 8, 11, Theme::TEXT_DIM);
+            }
+        }
+    }
+    EndScissorMode();
+    if (listContentH > listRect.height) { // scrollbar
+        float barH = listRect.height * listRect.height / listContentH;
+        float barY = listRect.y + ed.listScroll / listContentH * listRect.height;
+        DrawRectangle((int)(listRect.x + listRect.width - 3), (int)barY, 3, (int)barH, Theme::BORDER);
+    }
+
+    // ---- Right panel: Properties of the selection ----
     DrawRectangle(insX, TOP_H, INS_W, H - TOP_H, Theme::PANEL);
     DrawLine(insX, TOP_H, insX, H, Theme::BORDER);
-    DrawText("Inspector", insX + 15, TOP_H + 10, 18, Theme::TEXT);
+    DrawText("Properties", insX + 14, TOP_H + 10, 18, Theme::TEXT);
+    DrawText(ed.selected >= 0 ? "Object" : "Environment", insX + 120, TOP_H + 14, 13, Theme::ACCENT);
 
-    if (ed.selected >= 0) {
-        Body& s = ed.bodies[ed.selected];
-        bool isImage = s.assetIndex >= 0;
-        DrawText(shapeName(s), insX + 15, 95, 14, Theme::TEXT_DIM);
-
-        // Size (uniform scale of the whole shape)
-        float newSize = s.radius;
-        GuiSlider({ (float)insX + 70, 125, 100, 20 }, "Size", TextFormat("%.0f", newSize), &newSize, 8.0f, 300.0f);
-        if (std::fabs(newSize - s.radius) > 0.01f) s.scaleBy(newSize / s.radius);
-
-        // Gravity: off until enabled for this shape
-        bool gEnabled = s.gravityEnabled;
-        GuiCheckBox({ (float)insX + 15, 157, 20, 20 }, "Enable gravity", &gEnabled);
-        if (gEnabled && !s.gravityEnabled && s.gravityScale <= 0.0f) s.gravityScale = 1.0f;
-        s.gravityEnabled = gEnabled;
-
-        float gMs2 = s.gravityScale * EARTH_G;
-        float newG = gMs2;
-        if (!s.gravityEnabled) GuiDisable();
-        GuiSlider({ (float)insX + 70, 187, 100, 20 }, "Gravity", TextFormat("%.1f m/s^2", newG), &newG, 0.0f, 30.0f);
-        if (!s.gravityEnabled) GuiEnable();
-        if (s.gravityEnabled && std::fabs(newG - gMs2) > 0.001f) s.gravityScale = newG / EARTH_G;
-
-        // Hex color (for images: a tint): text box + live swatch
-        if (!ed.hexEdit) {
-            std::snprintf(ed.hexBuf, sizeof(ed.hexBuf), "#%02X%02X%02X", s.color.r, s.color.g, s.color.b);
-        }
-        DrawText(isImage ? "Tint" : "Hex", insX + 15, 228, 14, Theme::TEXT);
-        if (GuiTextBox({ (float)insX + 50, 222, 100, 26 }, ed.hexBuf, 8, ed.hexEdit)) ed.hexEdit = !ed.hexEdit;
-        if (ed.hexEdit) {
-            Color parsed;
-            if (parseHexColor(ed.hexBuf, parsed)) s.color = parsed;
-        }
-        DrawRectangle(insX + 160, 222, 26, 26, s.color);
-        DrawRectangleLines(insX + 160, 222, 26, 26, Theme::BORDER);
-
-        // Color picker (only adopt its value while the user is actually dragging in it)
-        Rectangle pickerArea = { (float)insX + 10, 262, 215, 160 };
-        Color picked = s.color;
-        GuiColorPicker({ (float)insX + 15, 267, 150, 150 }, "", &picked);
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && CheckCollisionPointRec(mouse, pickerArea) &&
-            (picked.r != s.color.r || picked.g != s.color.g || picked.b != s.color.b)) {
-            s.color = Color{ picked.r, picked.g, picked.b, 255 };
-        }
-
-        if (GuiButton({ (float)insX + 15, 437, 130, 30 }, "Delete shape")) deleteSelected = true;
-        DrawText("or press Delete", insX + 155, 445, 12, Theme::TEXT_DIM);
-    } else {
-        DrawText("Click a shape to edit it,", insX + 15, 95, 16, Theme::TEXT);
-        DrawText("or drag one in from the left.", insX + 15, 115, 16, Theme::TEXT);
-        DrawText("Size, color and gravity are set", insX + 15, 150, 14, Theme::TEXT_DIM);
-        DrawText("per shape. Gravity is off until", insX + 15, 168, 14, Theme::TEXT_DIM);
-        DrawText("you enable it.", insX + 15, 186, 14, Theme::TEXT_DIM);
+    BeginScissorMode((int)insRect.x + 1, (int)insViewTop, (int)insRect.width - 1, (int)(insViewBottom - insViewTop));
+    Ui ui{ (float)insX + 16.0f, (float)INS_W - 34.0f, insViewTop, insViewBottom, insViewTop - ed.inspectorScroll + 4.0f, mouse };
+    float contentStart = ui.y;
+    if (ed.selected >= 0) objectInspector(ed, ui, bounds, deleteSelected, duplicateSelected);
+    else environmentInspector(ed, ui, maxOffset);
+    EndScissorMode();
+    ed.inspectorContentH = (ui.y - contentStart) + 12.0f;
+    if (ed.inspectorContentH > insViewH) { // scrollbar
+        float barH = insViewH * insViewH / ed.inspectorContentH;
+        float barY = insViewTop + ed.inspectorScroll / ed.inspectorContentH * insViewH;
+        DrawRectangle(W - 4, (int)barY, 3, (int)barH, Theme::BORDER);
     }
 
-    // World settings
-    DrawText("World", insX + 15, 495, 18, Theme::TEXT);
-    GuiSlider({ (float)insX + 70, 525, 100, 20 }, "Ground", TextFormat("%.0f px", ed.groundOffset),
-              &ed.groundOffset, 10.0f, maxOffset);
-    GuiSlider({ (float)insX + 70, 555, 100, 20 }, "Bounce", TextFormat("%.2f", ed.params.restitution),
-              &ed.params.restitution, 0.0f, 1.0f);
-    if (GuiButton({ (float)insX + 15, 590, 115, 26 }, "Gravity: all on")) {
-        for (auto& b : ed.bodies) b.gravityEnabled = true;
-    }
-    if (GuiButton({ (float)insX + 140, 590, 115, 26 }, "Gravity: all off")) {
-        for (auto& b : ed.bodies) b.gravityEnabled = false;
-    }
-
-    // Drag-and-drop ghost (on top of everything)
+    // ---- Drag-and-drop ghost (on top of everything) ----
     if (ed.paletteDrag >= 0) {
         Body ghost = makeShape(ed.paletteDrag, m, 28.0f, (int)ed.paletteSides, 0.0f, ed.paletteColor);
         drawBody(ghost, false, true);
@@ -1330,6 +1709,9 @@ void editorFrame(Editor& ed, float& accumulator, AppMode& mode) {
         else g_assetMsg = note;
     }
 
+    if (duplicateSelected && ed.selected >= 0 && ed.selected < (int)ed.bodies.size()) {
+        duplicateObject(ed, ed.selected);
+    }
     if (deleteSelected && ed.selected >= 0 && ed.selected < (int)ed.bodies.size()) {
         ed.bodies.erase(ed.bodies.begin() + ed.selected);
         ed.selected = -1;
@@ -1342,7 +1724,7 @@ int main() {
     // F11 toggles true borderless fullscreen; ESC leaves fullscreen, or quits from the window.
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(1280, 800, "C++ Physics Engine - raylib + raygui");
-    SetWindowMinSize(1000, 720);
+    SetWindowMinSize(1100, 720);
     MaximizeWindow();
     SetExitKey(KEY_NULL);
     SetTargetFPS(60);
@@ -1352,8 +1734,7 @@ int main() {
     AppMode mode = AppMode::SPAWNER;
     SpawnerState spawner;
     Editor editor;
-    editor.params.gravity = EARTH_G * PIXELS_PER_METER; // 1g; each shape opts in and scales it
-    editor.params.restitution = 0.4f;
+    editor.params.useBodyMaterials = true; // each object uses its own bounciness / friction
 
     float accumulator = 0.0f;
     bool quit = false;
